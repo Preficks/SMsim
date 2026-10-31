@@ -1,6 +1,10 @@
 #include <initializer_list>
 #include <iostream>
+#include <vector>
+#include <queue>
 
+constexpr int NO_REG = -1;
+constexpr int REGS_PER_THREAD = 64;
 
 enum class OpClass { INT, FP32, FP64 }; // Classes of types since operations within each class take roughly the same amount of time
 
@@ -19,10 +23,30 @@ struct MemRequest {
   uint32_t active_mask;
 };
 
+struct Register {
+  int id;
+  uint32_t value;
+  bool pending_write; // If true then the register is waiting for a write to complete
+};
+
 class SMMemUnit { // Models the l1 cache and shared mem of the SM, fixed-latency for now, LRU set assosciative cache for later
   std::queue<MemRequest> requests;
-  void cycle() {
+  std::array<Register, 32> registers;
+  uint32_t latency; // Latency of the memory unit in cycles
 
+  void cycle() {
+    
+  }
+
+  public:
+
+  void request(MemRequest req) { // Another request pushed to the queue
+    registers[req.dst_reg].pending_write = true;
+    requests.push(req);
+  }
+
+  bool is_pending_write(int reg_id) {
+    return registers[reg_id].pending_write;
   }
 };
 
@@ -37,10 +61,41 @@ struct Warp {
 
 };
 
+struct Scoreboard {
+  std::vector<std::array<bool, REGS_PER_THREAD>> pending; 
+public: 
+  explicit Scoreboard(int nwarps) : pending(nwarps) {}
+  bool has_hazard(int w, const Instruction& in) const {
+    for (int r : in.src) {
+      if (r != NO_REG && pending[w][r]) return true;   // RAW
+    }
+    return in.dst != NO_REG && pending[w][in.dst];                        // WAW
+  }
+  void reserve(int w, int r) { if (r != NO_REG) pending[w][r] = true; }
+  void release(int w, int r) { if (r != NO_REG) pending[w][r] = false; }
+};
+
+class FixedLatencyUnit {
+  struct inFlight { int warp; int dst; uint64_t readyCycle; };
+  std::deque<inFlight> inflight;
+  uint32_t latency, capacity;
+public: 
+  FixedLatencyUnit(uint32_t l, uint32_t c) : latency(l), capacity(c) {}
+  bool isFull() const { return inflight.size() >= capacity; }
+  void push(int w, int d, uint64_t cycle) { inflight.push_back({w,d,cycle+latency}); }
+  void cycle(uint64_t cycle, Scoreboard& sb) {
+    while (!inflight.empty() && inflight.front().readyCycle <= cycle) {
+      sb.release(inflight.front().warp, inflight.front().dst);
+      inflight.pop_front();
+    }
+  }
+};
+
 class SM { // This will be the thing that handles next instruction
   std::queue<Warp> pipeline; // Models the current pipeline (6 stages, each 1 cycle)
   SMMemUnit memory;
   std::vector<Warp> warps;
+
 
   public:
 
@@ -49,7 +104,12 @@ class SM { // This will be the thing that handles next instruction
   }
 
   void run_scheduler() { // loose round robin scheduling
-
+    for(int i{}; i < warps.size(); i++) {
+      if(warps[i].stalled) {
+        continue;
+      }
+      memory.request(MemRequest{warps[i].id, warps[i].idx, MemSpace::SHARED, {0 /* Doesnt matter rn*/}, 0xFFFFFFFF});
+    }
   }
 };
 
@@ -79,12 +139,3 @@ int main() {
 
 }
 
-/*
- * What kind of questions do I want to ask
- * How can I most effectively prepare for the role?
- * What kind of things are you looking for?
- * Any gaps in my knowledge I should fill?
- * I should lowkey ask if graduating in 2029 is chill
- *
- *
- */
