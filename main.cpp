@@ -2,9 +2,11 @@
 #include <iostream>
 #include <vector>
 #include <queue>
+#include <unordered_map>
 
 constexpr int NO_REG = -1;
 constexpr int REGS_PER_THREAD = 64;
+constexpr int k_num_pipeline_phases = 6;
 
 enum class OpClass { INT, FP32, FP64 }; // Classes of types since operations within each class take roughly the same amount of time
 
@@ -55,64 +57,87 @@ struct Warp {
   int idx; //
   uint32_t mask; // Active mask, tells which elements are being operated on
   bool stalled; // If true then stalled, wait another clock cycle
-  std::vector<Instruction> instructions;
+  std::deque<Instruction> instructions;
 
   explicit Warp(int i) : id(i) {}
+};
 
+struct LogicUnit {
+  int max_instructions; // max size of the queue
+  int latency; // latency of the logic unit, in cycles
+  std::queue<std::pair<Instruction, int>> enqueued_instructions;
+  explicit LogicUnit(int m, int l) : max_instructions(m), latency(l) {}
+  void enqueue(Instruction& inst, int cycle) {
+    enqueued_instructions.push(std::pair<Instruction, int>{inst, cycle + latency});
+  }
+  bool ready(int cycle) {
+    if(cycle >= enqueued_instructions.front().second) return true;
+  }
+  bool pop(int cycle) {
+    if(ready(cycle)) {
+      enqueued_instructions.pop();
+      return true;
+    } 
+    return false;
+  }
 };
 
 struct Scoreboard {
-  std::vector<std::array<bool, REGS_PER_THREAD>> pending; 
-public: 
-  explicit Scoreboard(int nwarps) : pending(nwarps) {}
-  bool has_hazard(int w, const Instruction& in) const {
-    for (int r : in.src) {
-      if (r != NO_REG && pending[w][r]) return true;   // RAW
-    }
-    return in.dst != NO_REG && pending[w][in.dst];                        // WAW
-  }
-  void reserve(int w, int r) { if (r != NO_REG) pending[w][r] = true; }
-  void release(int w, int r) { if (r != NO_REG) pending[w][r] = false; }
+  std::unordered_map<int, bool> warps; 
+  explicit Scoreboard(uint32_t num_warps) : warps(num_warps) {}
+  bool is_valid(const Warp& x) { return warps[x.id]; }
 };
 
-class FixedLatencyUnit {
-  struct inFlight { int warp; int dst; uint64_t readyCycle; };
-  std::deque<inFlight> inflight;
-  uint32_t latency, capacity;
-public: 
-  FixedLatencyUnit(uint32_t l, uint32_t c) : latency(l), capacity(c) {}
-  bool isFull() const { return inflight.size() >= capacity; }
-  void push(int w, int d, uint64_t cycle) { inflight.push_back({w,d,cycle+latency}); }
-  void cycle(uint64_t cycle, Scoreboard& sb) {
-    while (!inflight.empty() && inflight.front().readyCycle <= cycle) {
-      sb.release(inflight.front().warp, inflight.front().dst);
-      inflight.pop_front();
-    }
-  }
-};
-
-class SM { // This will be the thing that handles next instruction
-  std::queue<Warp> pipeline; // Models the current pipeline (6 stages, each 1 cycle)
+class SM { 
   SMMemUnit memory;
   std::vector<Warp> warps;
-
+  LogicUnit LU{INT_MAX, 1}; // Ideal LU, used for every instructin type for now
+  int idx = 0; // for round robin scheduling
+  int cycle_count{};
 
   public:
 
   void cycle() {
-    run_scheduler();
+    writeback();
+    execute();
+    read_operands();
+    issue();         
+    decode();
+    fetch();
+
+    ++cycle_count;
   }
 
-  void run_scheduler() { // loose round robin scheduling
-    for(int i{}; i < warps.size(); i++) {
-      if(warps[i].stalled) {
-        continue;
-      }
-      memory.request(MemRequest{warps[i].id, warps[i].idx, MemSpace::SHARED, {0 /* Doesnt matter rn*/}, 0xFFFFFFFF});
+  void writeback() { //TODO: loop through LUs and pop, clear the screboard
+
+  }
+
+  bool can_issue(const Warp& warp) { 
+    return true; 
+  }
+
+  bool issue() { // TODO: Add consideration of Logic units and if already pushed this phase for multiple schedulers
+    const int n = warps.size();
+    if (n == 0) return false;
+
+    for(int i{}; i < n; i++) {
+      int w = (idx + i) % n;
+      auto& warp = warps[w];
+
+      if(warp.instructions.empty()) continue;
+      if(!can_issue(warp)) continue;
+
+      LU.enqueued_instructions.push(std::move(warp.instructions.front()));
+      warp.instructions.pop_front();           
+
+      idx = (w + 1) % n;                      
+      return true;
     }
+    return false;    
   }
+  
 };
-
+/* Not ready for this abstraction; wait till SM is fully fleshed out */
 class GPU {
   std::vector<SM*> sms;
   uint64_t clock_cycles;
