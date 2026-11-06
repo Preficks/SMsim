@@ -8,6 +8,10 @@ constexpr int NO_REG = -1;
 constexpr int REGS_PER_THREAD = 64;
 constexpr int k_num_pipeline_phases = 6;
 
+constexpr int k_num_registers_per_thread = 1;
+constexpr int k_num_warps_per_sm = 32;
+constexpr int k_num_registers_per_sm = k_num_registers_per_thread * k_num_warps_per_sm;
+
 enum class OpClass { INT, FP32, FP64 }; // Classes of types since operations within each class take roughly the same amount of time
 
 struct Instruction {
@@ -31,24 +35,37 @@ struct Register {
   bool pending_write; // If true then the register is waiting for a write to complete
 };
 
+struct Scoreboard {
+  std::array<uint32_t, k_num_warps_per_sm> warps; // boolean flag per group of registers, vulkan inspo
+  explicit Scoreboard() {}
+  bool is_valid(const uint32_t addr) { return warps[addr/32] & (1 << (addr % 32)); }
+};
+
 class SMMemUnit { // Models the l1 cache and shared mem of the SM, fixed-latency for now, LRU set assosciative cache for later
-  std::queue<MemRequest> requests;
-  std::array<Register, 32> registers;
+  std::queue<std::pair<MemRequest, int>> requests;
+  std::array<Register, k_num_registers_per_sm> registers;
   uint32_t latency; // Latency of the memory unit in cycles
 
   void cycle() {
-    
+
   }
 
   public:
 
-  void request(MemRequest req) { // Another request pushed to the queue
+  void request(MemRequest req, int clock_cycle) { // Another request pushed to the queue
     registers[req.dst_reg].pending_write = true;
-    requests.push(req);
+    requests.push(std::pair<MemRequest, int>{req, clock_cycle});
   }
 
   bool is_pending_write(int reg_id) {
     return registers[reg_id].pending_write;
+  }
+
+  bool pop(int clock_cycle, Scoreboard& sb) {
+    if(requests.front().second < clock_cycle) return false;
+
+    sb.warps[requests.front().first.addr[0]] = sb.warps[requests.front().first.addr[0]] & 0; // clears it, kinda convoluted pls fix
+    return true;
   }
 };
 
@@ -67,30 +84,33 @@ struct LogicUnit {
   int latency; // latency of the logic unit, in cycles
   std::queue<std::pair<Instruction, int>> enqueued_instructions;
   explicit LogicUnit(int m, int l) : max_instructions(m), latency(l) {}
+
   void enqueue(Instruction& inst, int cycle) {
     enqueued_instructions.push(std::pair<Instruction, int>{inst, cycle + latency});
   }
+
   bool ready(int cycle) {
     if(cycle >= enqueued_instructions.front().second) return true;
+    return false;
   }
+
   bool pop(int cycle) {
     if(ready(cycle)) {
       enqueued_instructions.pop();
       return true;
-    } 
+    }
     return false;
+  }
+
+  Instruction& top() {
+    return enqueued_instructions.front().first;
   }
 };
 
-struct Scoreboard {
-  std::unordered_map<int, bool> warps; 
-  explicit Scoreboard(uint32_t num_warps) : warps(num_warps) {}
-  bool is_valid(const Warp& x) { return warps[x.id]; }
-};
-
-class SM { 
+class SM {
   SMMemUnit memory;
   std::vector<Warp> warps;
+  Scoreboard sb;
   LogicUnit LU{INT_MAX, 1}; // Ideal LU, used for every instructin type for now
   int idx = 0; // for round robin scheduling
   int cycle_count{};
@@ -101,19 +121,22 @@ class SM {
     writeback();
     execute();
     read_operands();
-    issue();         
+    issue();
     decode();
     fetch();
 
     ++cycle_count;
   }
 
-  void writeback() { //TODO: loop through LUs and pop, clear the screboard
-
+  void writeback() { //TODO: loop through LUs and pop, clear the scoreboard
+    if(LU.ready(cycle_count)) {
+      auto& top_instruction = LU.top();
+      sb.warps[]
+    }
   }
 
-  bool can_issue(const Warp& warp) { 
-    return true; 
+  bool can_issue(const Warp& warp) {
+    return true;
   }
 
   bool issue() { // TODO: Add consideration of Logic units and if already pushed this phase for multiple schedulers
@@ -128,14 +151,14 @@ class SM {
       if(!can_issue(warp)) continue;
 
       LU.enqueued_instructions.push(std::move(warp.instructions.front()));
-      warp.instructions.pop_front();           
+      warp.instructions.pop_front();
 
-      idx = (w + 1) % n;                      
+      idx = (w + 1) % n;
       return true;
     }
-    return false;    
+    return false;
   }
-  
+
 };
 /* Not ready for this abstraction; wait till SM is fully fleshed out */
 class GPU {
@@ -163,4 +186,3 @@ class GPU {
 int main() {
 
 }
-
